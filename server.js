@@ -13,16 +13,44 @@ app.get("/scrape", async (req, res) => {
   try {
     browser = await chromium.launch({
       headless: true,
-      args: ["--no-sandbox", "--disable-dev-shm-usage"]
+      args: ["--no-sandbox", "--disable-dev-shm-usage"],
     });
+
     const context = await browser.newContext({
       userAgent:
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+      locale: "en-GB",
+      timezoneId: "Europe/London",
     });
+
     const page = await context.newPage();
-    await page.goto(url, { waitUntil: "networkidle", timeout: 30000 });
-    await page.waitForTimeout(1500);
-    const title = await page.title();
+    page.setDefaultNavigationTimeout(90_000);
+    page.setDefaultTimeout(90_000);
+
+    // Speed up & reduce flakiness: skip heavy assets
+    await page.route("**/*", (route) => {
+      const t = route.request().resourceType();
+      if (t === "image" || t === "font" || t === "media") return route.abort();
+      return route.continue();
+    });
+
+    // Use a more forgiving wait condition
+    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60_000 });
+
+    // Give CF / dynamic scripts a moment
+    await page.waitForTimeout(2000);
+
+    // If we hit a CF interstitial, wait again briefly
+    let title = await page.title();
+    if (/just a moment|cloudflare/i.test(title)) {
+      await page.waitForTimeout(4000);
+      try { await page.waitForLoadState("networkidle", { timeout: 10_000 }); } catch {}
+      title = await page.title();
+    }
+
+    // Try to ensure some meaningful content exists
+    try { await page.waitForSelector("h1, main, article", { timeout: 15_000 }); } catch {}
+
     const html = await page.content();
     res.json({ url, title, html });
   } catch (err) {
