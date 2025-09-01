@@ -1,10 +1,8 @@
 // server.js
-const express = require('express');
-const cors = require('cors');
-const { chromium } = require('playwright'); // 1.45.x in the base image
+  const express = require('express');
+  const { chromium } = require('playwright');
 
-const app = express();
-app.use(cors());
+  const app = express();
 
 const PORT = process.env.PORT || 3000;
 
