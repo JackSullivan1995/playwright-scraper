@@ -1,9 +1,13 @@
-FROM mcr.microsoft.com/playwright:v1.54.0-noble
+# Use Playwright’s maintained image with browsers preinstalled
+FROM mcr.microsoft.com/playwright:v1.45.2-jammy
 
 WORKDIR /app
+
 COPY package*.json ./
-RUN npm install --omit=dev
+RUN npm ci
+
 COPY . .
-ENV NODE_ENV=production
-EXPOSE 10000
-CMD ["node", "server.js"]
+
+EXPOSE 3000
+CMD ["npm", "start"]
+
