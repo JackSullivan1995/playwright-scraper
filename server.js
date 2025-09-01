@@ -17,64 +17,92 @@ app.get("/scrape", async (req, res) => {
   try {
     browser = await chromium.launch({
       headless: true,
-      args: ["--no-sandbox", "--disable-dev-shm-usage"],
+      args: [
+        "--no-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-blink-features=AutomationControlled"
+      ],
     });
 
-    // Use real desktop settings (UA/viewport/etc), locale & timezone
+    // Make the context look like a real desktop Chrome, keep JS/cookies on
     const context = await browser.newContext({
       ...desktop,
       locale: "en-GB",
       timezoneId: "Europe/London",
+      ignoreHTTPSErrors: true,
+      bypassCSP: true,            // don’t block third-party scripts like Turnstile
+      javaScriptEnabled: true,
+      acceptDownloads: false,
     });
 
-    // Slightly more realistic headers
+    // Subtle anti-bot hardening (harmless)
+    await context.addInitScript(() => {
+      // navigator.webdriver -> undefined
+      Object.defineProperty(navigator, "webdriver", { get: () => undefined });
+      // languages
+      Object.defineProperty(navigator, "languages", { get: () => ["en-GB", "en"] });
+      // plugins length > 0
+      Object.defineProperty(navigator, "plugins", { get: () => [1, 2, 3] });
+    });
+
     await context.setExtraHTTPHeaders({
       "Accept-Language": "en-GB,en;q=0.9",
       "Upgrade-Insecure-Requests": "1",
+      "DNT": "1",
     });
 
     const page = await context.newPage();
     page.setDefaultNavigationTimeout(90_000);
     page.setDefaultTimeout(90_000);
 
-    // IMPORTANT: do NOT block fonts/images; Cloudflare may require them.
-    // (If you later want to speed up, only block 'media' after it's working.)
-    // await page.route("**/*", (route) => {
-    //   const t = route.request().resourceType();
-    //   if (t === "media") return route.abort();
-    //   return route.continue();
-    // });
+    // DO NOT block fonts/images — Cloudflare/Turnstile may need them
 
-    // Navigate + staged waits
-    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60_000 });
-
-    // Let scripts/challenge init
-    await page.waitForTimeout(1500);
-    try { await page.waitForLoadState("networkidle", { timeout: 15_000 }); } catch {}
-
-    // Retry loop if Cloudflare challenge title shows
-    let title = await page.title();
-    for (let i = 0; i < 3 && /just a moment|cloudflare/i.test(title); i++) {
-      await page.waitForTimeout(4000);
+    // 1) Warm the root domain first (lets CF set cookies/challenge once)
+    try {
+      await page.goto("https://www.hrgrapevine.com/", { waitUntil: "domcontentloaded", timeout: 60_000 });
+      // Small settle time + best-effort idle
+      await page.waitForTimeout(1500);
       try { await page.waitForLoadState("networkidle", { timeout: 10_000 }); } catch {}
-      title = await page.title();
+    } catch {}
+
+    // Helper: wait until the title is no longer the challenge title
+    async function waitUntilNotChallenge(p, maxMs = 30000) {
+      const start = Date.now();
+      let title = await p.title();
+      while (/just a moment/i.test(title) && Date.now() - start < maxMs) {
+        await p.waitForTimeout(3000);
+        try { await p.waitForLoadState("networkidle", { timeout: 8000 }); } catch {}
+        title = await p.title();
+      }
+      return title;
     }
 
-    // As a last resort, re-navigate once (some challenges finish after a short delay)
-    if (/just a moment|cloudflare/i.test(title)) {
+    // 2) Go to the requested page
+    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60_000 });
+    let title = await waitUntilNotChallenge(page, 40_000);
+
+    // 3) If still on challenge, try one reload (some CF flows finish on reload)
+    if (/just a moment/i.test(title)) {
       await page.waitForTimeout(2000);
       try {
-        await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60_000 });
-        await page.waitForTimeout(1500);
-        try { await page.waitForLoadState("networkidle", { timeout: 10_000 }); } catch {}
-        title = await page.title();
+        await page.reload({ waitUntil: "domcontentloaded", timeout: 60_000 });
+        title = await waitUntilNotChallenge(page, 20_000);
       } catch {}
     }
 
-    // Try to ensure page has some meaningful DOM
-    try {
-      await page.waitForSelector("main, article, h1, .listing, .article-list", { timeout: 15_000 });
-    } catch {}
+    // 4) As a last resort, re-visit root once more, then back to target
+    if (/just a moment/i.test(title)) {
+      try {
+        await page.goto("https://www.hrgrapevine.com/", { waitUntil: "domcontentloaded", timeout: 60_000 });
+        await page.waitForTimeout(1500);
+        try { await page.waitForLoadState("networkidle", { timeout: 8000 }); } catch {}
+        await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60_000 });
+        title = await waitUntilNotChallenge(page, 20_000);
+      } catch {}
+    }
+
+    // Try ensuring some content exists (best-effort)
+    try { await page.waitForSelector("main, article, h1, .listing, .article-list", { timeout: 15000 }); } catch {}
 
     const finalUrl = page.url();
     const html = await page.content();
@@ -102,4 +130,3 @@ const PORT = process.env.PORT || 10000;
 app.listen(PORT, "0.0.0.0", () => {
   console.log("Server listening on", PORT);
 });
-
